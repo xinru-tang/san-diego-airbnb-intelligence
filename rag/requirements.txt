@@ -1,0 +1,6 @@
+openai>=1.0
+python-dotenv
+pandas
+numpy
+py3langid
+streamlit

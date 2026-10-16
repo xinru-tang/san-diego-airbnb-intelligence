@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+rag/index.npz
+rag/reviews_clean.csv
+rag/listings.csv
+rag/reviews.csv
+rag/listings_clean.csv
+rag/reviews_sample_for_rag.csv

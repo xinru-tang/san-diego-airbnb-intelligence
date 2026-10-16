@@ -1,0 +1,676 @@
+---
+title: "San Diego Airbnb — Data Cleaning & EDA"
+subtitle: "Group 11 | Module 3 Final Project"
+author: "Xin Cai, Boon Hun Joshua Gan, Yuhan Luan, Jose Mendoza, Xinru Tang"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.width = 9,
+  fig.height = 5,
+  fig.align = "center"
+)
+```
+
+# Overview
+
+This notebook performs **end-to-end data preparation and exploratory data analysis (EDA)** for the San Diego Airbnb Market Intelligence Dashboard project.
+
+**Single data source:** Inside Airbnb ([insideairbnb.com](https://insideairbnb.com)), San Diego. Both `listings` and `reviews` come from the same scrape, so `listing_id` joins are clean and reliable.
+
+**Note on geography:** the `neighbourhood_group_cleansed` field is empty in the San Diego scrape (verified: 100% NULL across ~13,000 rows). All geographic analysis therefore uses `neighbourhood_cleansed` only.
+
+**Note on forecast:** this notebook prepares `reviews_monthly.csv` as the **input** to the `auto.arima` forecast (Chart 4). The actual forecast is implemented separately — either in Tableau via Rserve or in a follow-up R script.
+
+## Inputs and outputs
+
+**Inputs** (place under `./data/raw/`):
+
+- `listings.csv` — San Diego Detailed Listings
+- `reviews.csv.gz` — San Diego Detailed Reviews (with `comments` text)
+
+**Outputs** written to `./data/clean/` and `./data/eda/`:
+
+| File | Purpose |
+|------|---------|
+| `listings_clean.csv` | Cleaned listings (USD prices, outliers removed) |
+| `reviews_sampled_scored.csv` | Per-review sentiment, stratified sample |
+| `sentiment_by_listing.csv` | Avg sentiment per listing — feeds Chart 6 |
+| `sentiment_by_neighbourhood.csv` | Avg sentiment per neighborhood — feeds Chart 5 |
+| `sentiment_by_neigh_month.csv` | Monthly sentiment by neighborhood (time view) |
+| `reviews_monthly.csv` | Monthly review volume — INPUT for Chart 4 forecast |
+| `neigh_opportunity.csv` | Neighborhood metrics for Chart 9 bubble chart |
+| `data/eda/*.csv`, `data/eda/*.png` | EDA summary tables and plots |
+
+---
+
+# Setup
+
+## Packages
+
+```{r packages, eval=FALSE}
+# Run once if needed:
+install.packages(c(
+  "tidyverse", "lubridate", "janitor", "scales",
+  "cld2",       # fast language detection
+  "syuzhet"     # lexicon-based sentiment scoring
+))
+```
+
+```{r load-libs}
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(scales)
+library(cld2)
+library(syuzhet)
+
+set.seed(42)  # reproducible sampling
+```
+
+## Folders
+
+```{r folders}
+dir.create("data/clean", showWarnings = FALSE, recursive = TRUE)
+dir.create("data/eda",   showWarnings = FALSE, recursive = TRUE)
+```
+
+## Tunable parameters
+
+> **Note:** the final sample size may be slightly above `SAMPLE_TARGET` because each neighbourhood is given a floor of `MIN_PER_NEIGH` (small areas get a guaranteed minimum so they don't disappear from the sample).
+
+```{r params}
+SAMPLE_TARGET <- 40000                    # 30-50k recommended
+MIN_PER_NEIGH <- 50                       # floor per neighbourhood
+PRICE_MAX     <- 10000                    # drop rows above this USD/night
+DATE_MIN      <- as.Date("2019-01-01")    # analysis window start
+DATE_MAX      <- as.Date("2025-09-30")    # roughly matches the scrape date
+```
+
+---
+
+# Part 1 — Clean listings
+
+## Read raw listings
+
+```{r read-listings}
+listings_raw <- read_csv(
+  "data/raw/listings.csv",
+  show_col_types = FALSE
+) %>% clean_names()
+
+cat("Raw listings rows:", nrow(listings_raw), "\n")
+```
+
+## Cleaning pipeline
+
+The cleaning steps:
+
+1. Parse `price` (stored as `"$1,200.00"`) to numeric.
+2. Drop rows with missing, non-positive, or extreme (`> $10,000/night`) prices.
+3. Standardise `host_is_superhost` and `instant_bookable` to Booleans.
+4. Parse date fields.
+5. Keep `review_scores_rating` missingness as `NA` (do **not** impute with 0).
+6. Select only the columns we'll use downstream.
+7. **Skip** `neighbourhood_group_cleansed` — empty for San Diego.
+
+```{r clean-listings}
+listings_clean <- listings_raw %>%
+  # 1. Parse price -> numeric
+  mutate(
+    price = suppressWarnings(
+      as.numeric(str_remove_all(as.character(price), "[\\$,]"))
+    )
+  ) %>%
+  # 2. Drop bad / extreme prices
+  filter(
+    !is.na(price),
+    price > 0,
+    price <= PRICE_MAX
+  ) %>%
+  # 3. Standardise Booleans
+  mutate(
+    host_is_superhost = case_when(
+      tolower(as.character(host_is_superhost)) %in% c("t", "true", "1") ~ TRUE,
+      tolower(as.character(host_is_superhost)) %in% c("f", "false", "0") ~ FALSE,
+      TRUE ~ NA
+    ),
+    instant_bookable = case_when(
+      tolower(as.character(instant_bookable)) %in% c("t", "true", "1") ~ TRUE,
+      tolower(as.character(instant_bookable)) %in% c("f", "false", "0") ~ FALSE,
+      TRUE ~ NA
+    )
+  ) %>%
+  # 4. Parse dates
+  mutate(
+    host_since   = ymd(host_since),
+    last_review  = ymd(last_review),
+    first_review = ymd(first_review)
+  ) %>%
+  # 5. review_scores_rating: keep NA, don't impute
+  mutate(
+    review_scores_rating = suppressWarnings(as.numeric(review_scores_rating))
+  ) %>%
+  # 6. Select usable columns (skip `neighbourhood_group_cleansed` — empty for SD)
+  select(
+    listing_id    = id,
+    host_id,
+    neighbourhood = neighbourhood_cleansed,
+    latitude, longitude,
+    room_type, property_type,
+    accommodates, bedrooms, beds, bathrooms_text,
+    price,
+    minimum_nights, maximum_nights,
+    host_since, host_is_superhost, host_total_listings_count,
+    instant_bookable,
+    review_scores_rating, number_of_reviews,
+    first_review, last_review
+  )
+
+cat("Cleaned listings rows:", nrow(listings_clean),
+    " (dropped", nrow(listings_raw) - nrow(listings_clean), ")\n")
+```
+
+## Save cleaned listings
+
+```{r save-listings}
+write_csv(listings_clean, "data/clean/listings_clean.csv")
+cat("Saved: data/clean/listings_clean.csv\n")
+```
+
+---
+
+# Part 2 — Clean & sample reviews, score sentiment
+
+## Read raw reviews
+
+```{r read-reviews}
+reviews_raw <- read_csv(
+  "data/raw/reviews.csv.gz",
+  show_col_types = FALSE
+) %>% clean_names()
+
+cat("Raw reviews rows:", nrow(reviews_raw), "\n")
+```
+
+## Sanity check: do reviews match listings?
+
+> **Why this matters:** if someone accidentally drops in a different city's `reviews.csv.gz`, every downstream join would silently fail. This check stops execution early with a clear error.
+
+```{r join-sanity}
+matched_reviews <- reviews_raw %>%
+  semi_join(listings_raw %>% transmute(listing_id = id), by = "listing_id") %>%
+  nrow()
+
+cat("Reviews matching listings:", matched_reviews,
+    sprintf(" (%.1f%% of raw reviews)\n",
+            matched_reviews / nrow(reviews_raw) * 100))
+
+if (matched_reviews == 0) {
+  stop("ERROR: reviews.csv.gz does not match listings.csv. ",
+       "Please use the San Diego detailed reviews file from the same ",
+       "Inside Airbnb scrape as listings.csv.")
+}
+```
+
+## Filter reviews
+
+We drop:
+
+- Reviews outside the analysis window (2019-2025)
+- Empty or very short comments (`< 15` characters)
+- Auto-generated system messages (cancellation notices etc.)
+- Non-English reviews (so syuzhet's English lexicon works correctly)
+
+Then we attach `neighbourhood` from `listings_clean` — cleaner than relying on whatever is in the reviews table.
+
+```{r filter-reviews}
+SYSTEM_PATTERNS <- regex(
+  paste(
+    "the host canceled",
+    "this is an automated posting",
+    "cancelled by the host",
+    "host cancell?ed this reservation",
+    sep = "|"
+  ),
+  ignore_case = TRUE
+)
+
+reviews_filtered <- reviews_raw %>%
+  mutate(date = ymd(date)) %>%
+  filter(!is.na(date), date >= DATE_MIN, date <= DATE_MAX) %>%
+  filter(!is.na(comments)) %>%
+  mutate(comments = str_squish(comments)) %>%
+  filter(nchar(comments) >= 15) %>%
+  filter(!str_detect(comments, SYSTEM_PATTERNS)) %>%
+  # English-only (cld2 is fast)
+  mutate(lang = cld2::detect_language(comments)) %>%
+  filter(lang == "en") %>%
+  select(-lang) %>%
+  # Keep only reviews tied to listings we kept
+  semi_join(listings_clean, by = "listing_id") %>%
+  # Attach neighbourhood from listings
+  left_join(
+    listings_clean %>% select(listing_id, neighbourhood),
+    by = "listing_id"
+  )
+
+cat("After filtering (English, in window, with neighbourhood):",
+    nrow(reviews_filtered), "\n")
+```
+
+## Stratified sample by neighborhood
+
+Proportional allocation across neighborhoods, with a per-neighborhood floor so even small areas get represented.
+
+```{r stratified-sample}
+per_neigh_counts <- reviews_filtered %>%
+  count(neighbourhood, name = "available")
+
+total_available <- sum(per_neigh_counts$available)
+per_neigh_counts <- per_neigh_counts %>%
+  mutate(
+    proportional = round(SAMPLE_TARGET * available / total_available),
+    target       = pmin(available, pmax(proportional, MIN_PER_NEIGH))
+  )
+
+reviews_sample <- reviews_filtered %>%
+  group_by(neighbourhood) %>%
+  group_modify(~ {
+    tgt <- per_neigh_counts$target[
+      per_neigh_counts$neighbourhood == .y$neighbourhood
+    ]
+    slice_sample(.x, n = min(nrow(.x), tgt))
+  }) %>%
+  ungroup()
+
+cat("Sampled reviews:", nrow(reviews_sample), "\n")
+```
+
+## Score sentiment with `syuzhet`
+
+> ⏱️ This step takes a few minutes for ~40K reviews. Sentiment scores are positive for positive tone, negative for negative tone, roughly in the range -5 to +10.
+
+```{r score-sentiment, cache=TRUE}
+cat("Scoring sentiment with syuzhet...\n")
+reviews_sample$sentiment <- get_sentiment(
+  reviews_sample$comments,
+  method = "syuzhet"
+)
+
+# Save slim per-review file (drop the full comments column to keep size small)
+write_csv(
+  reviews_sample %>%
+    select(listing_id, review_id = id, date, neighbourhood, sentiment),
+  "data/clean/reviews_sampled_scored.csv"
+)
+cat("Saved: data/clean/reviews_sampled_scored.csv\n")
+```
+
+---
+
+# Part 3 — Pre-aggregates for Tableau
+
+Tableau performs best when fed **small summary tables** rather than hundreds of thousands of raw reviews. We pre-aggregate at four levels.
+
+## 3.1 Per listing (feeds Chart 6)
+
+One row per listing, with `avg_sentiment` joined to listings on `listing_id` in Tableau to produce the listing-level price vs sentiment scatter.
+
+```{r agg-listing}
+sentiment_by_listing <- reviews_sample %>%
+  group_by(listing_id) %>%
+  summarise(
+    n_reviews_scored = n(),
+    avg_sentiment    = mean(sentiment, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(sentiment_by_listing, "data/clean/sentiment_by_listing.csv")
+cat("Saved: data/clean/sentiment_by_listing.csv\n")
+```
+
+## 3.2 Per neighborhood (feeds Chart 5)
+
+```{r agg-neigh}
+sentiment_by_neigh <- reviews_sample %>%
+  group_by(neighbourhood) %>%
+  summarise(
+    n_reviews     = n(),
+    avg_sentiment = mean(sentiment, na.rm = TRUE),
+    med_sentiment = median(sentiment, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(avg_sentiment))
+
+write_csv(sentiment_by_neigh, "data/clean/sentiment_by_neighbourhood.csv")
+cat("Saved: data/clean/sentiment_by_neighbourhood.csv\n")
+
+head(sentiment_by_neigh, 10)
+```
+
+## 3.3 Per neighborhood × month (optional time view)
+
+```{r agg-neigh-month}
+sentiment_by_neigh_month <- reviews_sample %>%
+  mutate(year_month = floor_date(date, unit = "month")) %>%
+  group_by(neighbourhood, year_month) %>%
+  summarise(
+    n_reviews     = n(),
+    avg_sentiment = mean(sentiment, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(sentiment_by_neigh_month, "data/clean/sentiment_by_neigh_month.csv")
+cat("Saved: data/clean/sentiment_by_neigh_month.csv\n")
+```
+
+## 3.4 Monthly review volume (INPUT for Chart 4 forecast)
+
+> Uses **all filtered reviews**, not just the sampled ones — the forecast needs the true monthly volume series, not a downsample.
+
+```{r agg-monthly}
+reviews_monthly <- reviews_filtered %>%
+  mutate(year_month = floor_date(date, unit = "month")) %>%
+  count(year_month, name = "review_count")
+
+write_csv(reviews_monthly, "data/clean/reviews_monthly.csv")
+cat("Saved: data/clean/reviews_monthly.csv (forecast INPUT)\n")
+```
+
+## 3.5 Neighborhood Opportunity table (feeds Chart 9)
+
+One row per neighborhood, with three metrics in their **native units** — no composite score is computed. Tableau plots `x = median price`, `y = avg sentiment`, `size = supply`. The reader interprets the quadrants based on their own investor preferences.
+
+```{r agg-opportunity}
+neigh_opportunity <- listings_clean %>%
+  group_by(neighbourhood) %>%
+  summarise(
+    supply       = n(),
+    median_price = median(price, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    sentiment_by_neigh %>% select(neighbourhood, avg_sentiment, n_reviews),
+    by = "neighbourhood"
+  ) %>%
+  # Keep neighborhoods with enough data for both axes to be reliable
+  filter(supply >= 20, !is.na(avg_sentiment), n_reviews >= 30)
+
+write_csv(neigh_opportunity, "data/clean/neigh_opportunity.csv")
+cat("Saved: data/clean/neigh_opportunity.csv  (Chart 9 input,",
+    nrow(neigh_opportunity), "neighborhoods)\n")
+```
+
+---
+
+# Part 4 — Exploratory Data Analysis (EDA)
+
+This section produces summary tables and plots that directly support the **descriptive statistics** narrative in the written report.
+
+## 4.1 Overall listing summary
+
+```{r eda-overall}
+eda_overall <- tibble(
+  metric = c("n_listings", "n_neighbourhoods",
+             "price_median", "price_mean", "price_p25", "price_p75",
+             "price_p95", "price_max",
+             "pct_superhost", "pct_entire_home"),
+  value = c(
+    nrow(listings_clean),
+    n_distinct(listings_clean$neighbourhood),
+    median(listings_clean$price, na.rm = TRUE),
+    mean(listings_clean$price,   na.rm = TRUE),
+    quantile(listings_clean$price, 0.25, na.rm = TRUE),
+    quantile(listings_clean$price, 0.75, na.rm = TRUE),
+    quantile(listings_clean$price, 0.95, na.rm = TRUE),
+    max(listings_clean$price,    na.rm = TRUE),
+    mean(listings_clean$host_is_superhost, na.rm = TRUE) * 100,
+    mean(listings_clean$room_type == "Entire home/apt", na.rm = TRUE) * 100
+  )
+)
+
+write_csv(eda_overall, "data/eda/eda_overall.csv")
+eda_overall
+```
+
+## 4.2 Room type breakdown
+
+```{r eda-room}
+eda_room <- listings_clean %>%
+  count(room_type) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  arrange(desc(n))
+
+write_csv(eda_room, "data/eda/eda_room_type.csv")
+eda_room
+```
+
+## 4.3 Neighborhood-level supply and price
+
+```{r eda-neigh}
+eda_neigh <- listings_clean %>%
+  group_by(neighbourhood) %>%
+  summarise(
+    n_listings    = n(),
+    median_price  = median(price, na.rm = TRUE),
+    pct_superhost = mean(host_is_superhost, na.rm = TRUE) * 100,
+    avg_rating    = mean(review_scores_rating, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_listings))
+
+write_csv(eda_neigh, "data/eda/eda_neighbourhood.csv")
+```
+
+**Top 10 neighborhoods by supply:**
+
+```{r eda-neigh-top-supply}
+head(eda_neigh, 10)
+```
+
+**Top 10 neighborhoods by median price:**
+
+```{r eda-neigh-top-price}
+eda_neigh %>% arrange(desc(median_price)) %>% head(10)
+```
+
+## 4.4 Price premium vs city median (feeds Chart 3)
+
+```{r eda-premium}
+city_median <- median(listings_clean$price, na.rm = TRUE)
+
+eda_premium <- listings_clean %>%
+  group_by(neighbourhood) %>%
+  summarise(
+    n_listings   = n(),
+    median_price = median(price, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    city_median = city_median,
+    premium_pct = (median_price - city_median) / city_median * 100
+  ) %>%
+  arrange(desc(premium_pct))
+
+write_csv(eda_premium, "data/eda/eda_premium.csv")
+
+cat("City median price: $", city_median, "\n", sep = "")
+```
+
+**Top 10 neighborhoods by price premium (% above city median):**
+
+```{r eda-premium-top}
+head(eda_premium, 10)
+```
+
+**Bottom 10 (largest discount):**
+
+```{r eda-premium-bottom}
+tail(eda_premium, 10)
+```
+
+## 4.5 Missingness check
+
+```{r eda-missing}
+eda_missing <- listings_clean %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "pct_missing") %>%
+  arrange(desc(pct_missing))
+
+write_csv(eda_missing, "data/eda/eda_missing.csv")
+head(eda_missing, 10)
+```
+
+## 4.6 Plots
+
+### Price distribution (log scale)
+
+The raw price distribution is so heavily right-skewed that a linear axis is unreadable. Log scale reveals the shape.
+
+```{r plot-price-dist}
+p_price <- ggplot(listings_clean, aes(x = price)) +
+  geom_histogram(bins = 60, fill = "#2E5496", colour = "white") +
+  scale_x_log10(labels = dollar_format()) +
+  labs(
+    title    = "Distribution of nightly price (log scale)",
+    subtitle = sprintf("n = %s listings | median $%.0f | mean $%.0f",
+                       comma(nrow(listings_clean)),
+                       median(listings_clean$price),
+                       mean(listings_clean$price)),
+    x = "Nightly price (USD, log scale)", y = "Listings"
+  ) +
+  theme_minimal()
+
+ggsave("data/eda/plot_price_distribution.png", p_price, width = 8, height = 5)
+p_price
+```
+
+### Top 20 neighborhoods by median price
+
+```{r plot-price-neigh, fig.height=7}
+p_neigh <- eda_neigh %>%
+  arrange(desc(median_price)) %>%
+  head(20) %>%
+  mutate(neighbourhood = fct_reorder(neighbourhood, median_price)) %>%
+  ggplot(aes(x = median_price, y = neighbourhood)) +
+  geom_col(fill = "#2E5496") +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(
+    title    = "Top 20 neighborhoods by median nightly price",
+    subtitle = sprintf("City median: $%.0f", city_median),
+    x = "Median price (USD)", y = NULL
+  ) +
+  theme_minimal()
+
+ggsave("data/eda/plot_price_by_neighbourhood.png", p_neigh, width = 9, height = 7)
+p_neigh
+```
+
+### Neighborhood price premium vs city median (preview of Chart 3)
+
+```{r plot-premium, fig.height=9}
+p_prem <- eda_premium %>%
+  filter(n_listings >= 20) %>%
+  arrange(desc(premium_pct)) %>%
+  slice(c(1:15, (n()-14):n())) %>%
+  mutate(
+    neighbourhood = fct_reorder(neighbourhood, premium_pct),
+    direction = ifelse(premium_pct >= 0, "premium", "discount")
+  ) %>%
+  ggplot(aes(x = premium_pct, y = neighbourhood, fill = direction)) +
+  geom_col() +
+  scale_x_continuous(labels = function(x) paste0(x, "%")) +
+  scale_fill_manual(values = c(premium = "#2E5496", discount = "#C0504D")) +
+  labs(
+    title    = "Neighborhood price premium / discount vs city median",
+    subtitle = "Top 15 premiums and bottom 15 discounts (neighborhoods with >=20 listings)",
+    x = "Premium relative to city median",
+    y = NULL, fill = NULL
+  ) +
+  theme_minimal()
+
+ggsave("data/eda/plot_price_premium.png", p_prem, width = 9, height = 9)
+p_prem
+```
+
+### Monthly review volume (Chart 4 forecast input)
+
+```{r plot-review-volume, fig.height=4}
+p_vol <- ggplot(reviews_monthly, aes(x = year_month, y = review_count)) +
+  geom_line(colour = "#2E5496") +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Monthly review volume (San Diego, filtered window)",
+    subtitle = "Proxy for booking demand — INPUT to Chart 4 auto.arima forecast",
+    x = NULL, y = "Review count"
+  ) +
+  theme_minimal()
+
+ggsave("data/eda/plot_review_volume.png", p_vol, width = 9, height = 4)
+p_vol
+```
+
+### Sentiment score distribution
+
+The dashed red line marks neutral sentiment (0). Most reviews are positive — typical for hospitality data.
+
+```{r plot-sentiment}
+p_sent <- ggplot(reviews_sample, aes(x = sentiment)) +
+  geom_histogram(bins = 50, fill = "#2E5496", colour = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "red") +
+  labs(
+    title    = "Distribution of review sentiment scores (syuzhet)",
+    subtitle = sprintf("n = %s sampled English reviews", comma(nrow(reviews_sample))),
+    x = "Sentiment score", y = "Reviews"
+  ) +
+  theme_minimal()
+
+ggsave("data/eda/plot_sentiment_distribution.png", p_sent, width = 8, height = 5)
+p_sent
+```
+
+### Neighborhood Opportunity Map (preview of Chart 9)
+
+The Tableau version of this chart will be larger and interactive. This R preview lets us sanity-check the structure before building it.
+
+```{r plot-bubble, fig.height=6}
+p_bubble <- ggplot(neigh_opportunity,
+                   aes(x = median_price, y = avg_sentiment, size = supply)) +
+  geom_point(alpha = 0.55, colour = "#2E5496") +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_size_continuous(range = c(2, 14), labels = comma) +
+  labs(
+    title    = "Neighborhood Opportunity Map (preview of Chart 9)",
+    subtitle = "x = median price | y = avg sentiment | bubble size = listing supply",
+    x = "Median nightly price (USD)",
+    y = "Average sentiment (syuzhet)",
+    size = "Listings"
+  ) +
+  theme_minimal()
+
+ggsave("data/eda/plot_neigh_opportunity.png", p_bubble, width = 9, height = 6)
+p_bubble
+```
+
+---
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
